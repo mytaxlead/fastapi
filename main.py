@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import math
 import hashlib
 from typing import Any, Dict, Optional
 
@@ -8,7 +9,7 @@ import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="MyTaxLead AI Worker", version="1.0.0")
+app = FastAPI(title="MyTaxLead AI Worker", version="1.0.1")
 
 
 def env(name: str, default: str = "") -> str:
@@ -18,7 +19,7 @@ def env(name: str, default: str = "") -> str:
 
 AI_WORKER_TOKEN = env("AI_WORKER_TOKEN")
 OPENAI_API_KEY = env("OPENAI_API_KEY")
-OPENAI_MODEL = env("OPENAI_MODEL", "gpt-5.2")  # good default
+OPENAI_MODEL = env("OPENAI_MODEL", "gpt-5.2")
 TIMEOUT_SECS = int(env("HTTP_TIMEOUT", "120"))
 
 
@@ -29,8 +30,10 @@ class AnalyzeRequest(BaseModel):
     original_name: str
     stored_name: Optional[str] = None
     signed_url: str
+
     callback_url: Optional[str] = None
     webhook_secret: Optional[str] = None
+
     hint: Optional[str] = None
 
 
@@ -58,7 +61,6 @@ def detect_kind(original_name: str, signed_url: str) -> str:
         return "csv"
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return "xlsx"
-    # fallback: try from url
     u = (signed_url or "").lower()
     for ext in (".pdf", ".csv", ".xlsx", ".xls"):
         if ext in u:
@@ -66,17 +68,31 @@ def detect_kind(original_name: str, signed_url: str) -> str:
     return "unknown"
 
 
+def _sanitize_jsonable(x: Any) -> Any:
+    # Converts NaN/Infinity to None so JSON encoder doesn't crash
+    if isinstance(x, float):
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return x
+    if isinstance(x, dict):
+        return {str(k): _sanitize_jsonable(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_sanitize_jsonable(v) for v in x]
+    return x
+
+
 def parse_csv_bytes(b: bytes) -> Dict[str, Any]:
     import pandas as pd
     from io import BytesIO
 
     df = pd.read_csv(BytesIO(b))
-    return {
+    out = {
         "rows": int(df.shape[0]),
         "cols": int(df.shape[1]),
         "columns": list(df.columns.astype(str)),
-        "preview": df.head(50).to_dict(orient="records"),
+        "preview": df.head(200).to_dict(orient="records"),
     }
+    return _sanitize_jsonable(out)
 
 
 def parse_xlsx_bytes(b: bytes) -> Dict[str, Any]:
@@ -86,14 +102,15 @@ def parse_xlsx_bytes(b: bytes) -> Dict[str, Any]:
     xls = pd.ExcelFile(BytesIO(b))
     sheets = {}
     for s in xls.sheet_names[:5]:
-        df = xls.parse(s).head(50)
+        df = xls.parse(s).head(200)
         sheets[s] = {
             "rows_preview": int(df.shape[0]),
             "cols": int(df.shape[1]),
             "columns": list(df.columns.astype(str)),
             "preview": df.to_dict(orient="records"),
         }
-    return {"sheets": sheets, "sheet_names": xls.sheet_names}
+    out = {"sheets": sheets, "sheet_names": xls.sheet_names}
+    return _sanitize_jsonable(out)
 
 
 def parse_pdf_bytes(b: bytes) -> Dict[str, Any]:
@@ -102,14 +119,14 @@ def parse_pdf_bytes(b: bytes) -> Dict[str, Any]:
 
     reader = PdfReader(BytesIO(b))
     pages = []
-    for i, p in enumerate(reader.pages[:8]):
+    for i, p in enumerate(reader.pages[:10]):
         txt = (p.extract_text() or "").strip()
-        pages.append({"page": i + 1, "text": txt[:6000]})
-    return {"pages": pages, "page_count": len(reader.pages)}
+        pages.append({"page": i + 1, "text": txt[:8000]})
+    out = {"pages": pages, "page_count": len(reader.pages)}
+    return _sanitize_jsonable(out)
 
 
 def llm_summary(extracted: Dict[str, Any], original_name: str) -> Dict[str, Any]:
-    # If no OpenAI key, return basic summary so pipeline still works.
     if not OPENAI_API_KEY:
         return {
             "ok": True,
@@ -127,14 +144,14 @@ def llm_summary(extracted: Dict[str, Any], original_name: str) -> Dict[str, Any]
         prompt = f"""
 You are an accounting document assistant.
 
-Given extracted data from a file named: {original_name}
+File name: {original_name}
 
-Return STRICT JSON ONLY with these keys:
-- summary: short human summary
-- doc_type: e.g. bank_statement, sales_report, invoice_list, payroll, unknown
-- key_fields: dict of important fields found (account name, period, totals, balances, etc.)
-- issues: list of issues/missing info
-- transactions_hint: if this contains transactions, describe the columns and what they mean
+Return STRICT JSON ONLY:
+- summary
+- doc_type (bank_statement / card_statement / invoice / payroll / unknown)
+- key_fields (account name, bank, period, opening/closing balance, totals)
+- issues (missing pages, unclear currency, etc.)
+- transactions_hint (what the columns mean / what to look for)
 """
 
         resp = client.responses.create(
@@ -161,20 +178,13 @@ Return STRICT JSON ONLY with these keys:
         if m:
             text = m.group(0)
 
-        try:
-            js = json.loads(text)
-            if not isinstance(js, dict):
-                raise ValueError("Not a JSON object")
-            js["ok"] = True
-            js["model"] = OPENAI_MODEL
-            return js
-        except Exception:
-            return {
-                "ok": True,
-                "model": OPENAI_MODEL,
-                "summary": "AI returned non-JSON. Returning raw output.",
-                "raw": text,
-            }
+        js = json.loads(text)
+        if not isinstance(js, dict):
+            raise ValueError("AI did not return a JSON object")
+
+        js["ok"] = True
+        js["model"] = OPENAI_MODEL
+        return _sanitize_jsonable(js)
 
     except Exception as e:
         return {
@@ -219,7 +229,6 @@ def debug_token():
 def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=None)):
     require_token(authorization)
 
-    # Build extracted payload
     kind = detect_kind(req.original_name, req.signed_url)
     b = download_to_bytes(req.signed_url)
 
@@ -242,51 +251,38 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
         else:
             extracted["data"] = {"note": "Unknown file type", "bytes": len(b)}
     except Exception as e:
-        # callback error too
+        payload = {
+            "job_id": req.job_id,
+            "upload_id": req.upload_id,
+            "client_id": req.client_id,
+            "status": "error",
+            "error": f"Parse failed: {e}",
+        }
         if req.callback_url and req.webhook_secret:
             try:
-                post_callback(req.callback_url, req.webhook_secret, {
-                    "job_id": req.job_id,
-                    "upload_id": req.upload_id,
-                    "client_id": req.client_id,
-                    "status": "error",
-                    "error": f"Parse failed: {e}",
-                })
+                post_callback(req.callback_url, req.webhook_secret, payload)
             except Exception:
                 pass
-        raise HTTPException(status_code=400, detail=f"Parse failed: {e}")
+        raise HTTPException(status_code=400, detail=payload["error"])
 
     summary = llm_summary(extracted, req.original_name)
 
-    # Always callback if provided
-    if req.callback_url and req.webhook_secret:
-        status = "done"
-        err_txt = ""
-        if isinstance(summary, dict) and summary.get("error"):
-            # still "done" is ok, but you can flip to error if you want
-            err_txt = str(summary.get("error"))
-
-        try:
-            post_callback(req.callback_url, req.webhook_secret, {
-                "job_id": req.job_id,
-                "upload_id": req.upload_id,
-                "client_id": req.client_id,
-                "status": status,
-                "error": err_txt,
-                "extracted": extracted,
-                "summary": summary,
-            })
-        except Exception as e:
-            # If callback fails, we still return ok to caller, but include warning
-            return {
-                "ok": True,
-                "warning": f"Callback failed: {e}",
-                "job_id": req.job_id,
-            }
-
-    return {
-        "ok": True,
+    payload = {
         "job_id": req.job_id,
         "upload_id": req.upload_id,
         "client_id": req.client_id,
+        "status": "done",
+        "error": "",
+        "extracted": extracted,
+        "summary": summary,
     }
+
+    # Callback back to your PHP webhook (preferred)
+    if req.callback_url and req.webhook_secret:
+        try:
+            post_callback(req.callback_url, req.webhook_secret, payload)
+        except Exception as e:
+            payload["warning"] = f"Callback failed: {e}"
+
+    # ALSO return full payload to the PHP caller (so you can store it even if callback fails)
+    return payload
