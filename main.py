@@ -11,9 +11,6 @@ from pydantic import BaseModel
 app = FastAPI(title="MyTaxLead AI Worker", version="1.0.0")
 
 
-# -------------------------------------------------
-# ENV HELPERS
-# -------------------------------------------------
 def env(name: str, default: str = "") -> str:
     v = os.getenv(name, default)
     return v.strip() if isinstance(v, str) else default
@@ -25,9 +22,6 @@ OPENAI_MODEL = env("OPENAI_MODEL", "gpt-5.1")
 TIMEOUT_SECS = int(env("HTTP_TIMEOUT", "120"))
 
 
-# -------------------------------------------------
-# MODELS
-# -------------------------------------------------
 class AnalyzeRequest(BaseModel):
     job_id: int
     upload_id: int
@@ -37,24 +31,16 @@ class AnalyzeRequest(BaseModel):
     hint: Optional[str] = None
 
 
-# -------------------------------------------------
-# SECURITY
-# -------------------------------------------------
 def require_token(authorization: Optional[str]) -> None:
     if not AI_WORKER_TOKEN:
         raise HTTPException(status_code=500, detail="AI_WORKER_TOKEN not set")
-
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
-
     token = authorization.split(" ", 1)[1].strip()
     if token != AI_WORKER_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
 
-# -------------------------------------------------
-# FILE HANDLING
-# -------------------------------------------------
 def download_to_bytes(url: str) -> bytes:
     r = requests.get(url, timeout=TIMEOUT_SECS)
     r.raise_for_status()
@@ -63,7 +49,6 @@ def download_to_bytes(url: str) -> bytes:
 
 def detect_kind(original_name: str, signed_url: str) -> str:
     name = (original_name or "").lower()
-
     if name.endswith(".pdf"):
         return "pdf"
     if name.endswith(".csv"):
@@ -75,7 +60,6 @@ def detect_kind(original_name: str, signed_url: str) -> str:
     for ext in (".pdf", ".csv", ".xlsx", ".xls"):
         if ext in u:
             return ext.replace(".", "")
-
     return "unknown"
 
 
@@ -98,7 +82,6 @@ def parse_xlsx_bytes(b: bytes) -> Dict[str, Any]:
 
     xls = pd.ExcelFile(BytesIO(b))
     sheets = {}
-
     for s in xls.sheet_names[:5]:
         df = xls.parse(s).head(20)
         sheets[s] = {
@@ -107,8 +90,7 @@ def parse_xlsx_bytes(b: bytes) -> Dict[str, Any]:
             "columns": list(df.columns.astype(str)),
             "preview": df.to_dict(orient="records"),
         }
-
-    return {"sheet_names": xls.sheet_names, "sheets": sheets}
+    return {"sheets": sheets, "sheet_names": xls.sheet_names}
 
 
 def parse_pdf_bytes(b: bytes) -> Dict[str, Any]:
@@ -117,30 +99,20 @@ def parse_pdf_bytes(b: bytes) -> Dict[str, Any]:
 
     reader = PdfReader(BytesIO(b))
     pages = []
-
     for i, p in enumerate(reader.pages[:5]):
-        text = (p.extract_text() or "").strip()
-        pages.append({
-            "page": i + 1,
-            "text": text[:4000]
-        })
-
-    return {
-        "page_count": len(reader.pages),
-        "pages": pages
-    }
+        txt = (p.extract_text() or "").strip()
+        pages.append({"page": i + 1, "text": txt[:4000]})
+    return {"pages": pages, "page_count": len(reader.pages)}
 
 
-# -------------------------------------------------
-# AI SUMMARY
-# -------------------------------------------------
 def llm_summary(extracted: Dict[str, Any], original_name: str) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
         return {
             "ok": True,
             "model": None,
-            "summary": "OPENAI_API_KEY not set. Extraction only.",
-            "flags": ["missing_openai_api_key"]
+            "summary": "OPENAI_API_KEY not set. Returning non-AI extracted preview only.",
+            "actions": [],
+            "flags": ["missing_openai_api_key"],
         }
 
     try:
@@ -149,49 +121,48 @@ def llm_summary(extracted: Dict[str, Any], original_name: str) -> Dict[str, Any]
 
         prompt = f"""
 You are an accounting document assistant.
-
-File name: {original_name}
-
-Return STRICT JSON with:
-- summary
-- doc_type
-- key_fields
-- issues
+Given extracted data from a file named: {original_name}
+Return JSON only with:
+- summary: short human summary
+- doc_type: what kind of document it is
+- key_fields: dict of important fields found
+- issues: list of possible issues/missing info
 """
 
         resp = client.responses.create(
             model=OPENAI_MODEL or "gpt-5.1",
             input=[
-                {"role": "system", "content": "Return JSON only. No markdown."},
+                {"role": "system", "content": "Return STRICT JSON only. No markdown."},
                 {"role": "user", "content": prompt},
                 {"role": "user", "content": json.dumps(extracted)[:150000]},
             ],
         )
 
-        text = getattr(resp, "output_text", "") or ""
+        text = ""
+        if hasattr(resp, "output_text"):
+            text = resp.output_text
+        else:
+            for item in getattr(resp, "output", []) or []:
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            text += c.get("text", "")
 
+        text = (text or "").strip()
         m = re.search(r"\{.*\}", text, re.S)
         if m:
             text = m.group(0)
 
         try:
-            return json.loads(text)
+            js = json.loads(text)
+            return {"ok": True, "model": OPENAI_MODEL, **js}
         except Exception:
-            return {
-                "summary": "AI returned non-JSON output",
-                "raw": text
-            }
+            return {"ok": True, "model": OPENAI_MODEL, "summary": "AI returned non-JSON.", "raw": text}
 
     except Exception as e:
-        return {
-            "summary": "AI failed, extraction only",
-            "error": str(e)
-        }
+        return {"ok": True, "model": OPENAI_MODEL, "summary": "AI call failed.", "error": str(e)}
 
 
-# -------------------------------------------------
-# ROUTES
-# -------------------------------------------------
 @app.get("/")
 def root():
     return {"ok": True, "service": "mytaxlead-ai-worker"}
@@ -204,7 +175,7 @@ def health():
 
 @app.get("/debug_token")
 def debug_token():
-    t = (AI_WORKER_TOKEN or "").strip()
+    t = AI_WORKER_TOKEN or ""
     return {
         "len": len(t),
         "sha256": hashlib.sha256(t.encode("utf-8")).hexdigest(),
@@ -220,12 +191,12 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
     kind = detect_kind(req.original_name, req.signed_url)
     b = download_to_bytes(req.signed_url)
 
-    extracted = {
+    extracted: Dict[str, Any] = {
         "kind": kind,
-        "job_id": req.job_id,
+        "original_name": req.original_name,
         "upload_id": req.upload_id,
         "client_id": req.client_id,
-        "original_name": req.original_name,
+        "job_id": req.job_id,
     }
 
     try:
@@ -236,7 +207,7 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
         elif kind == "pdf":
             extracted["data"] = parse_pdf_bytes(b)
         else:
-            extracted["data"] = {"bytes": len(b), "note": "Unknown file type"}
+            extracted["data"] = {"note": "Unknown file type", "bytes": len(b)}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Parse failed: {e}")
 
