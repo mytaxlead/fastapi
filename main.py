@@ -1,20 +1,24 @@
 import os
 import json
 import re
-from typing import Optional, Any, Dict
+from typing import Any, Dict, Optional
 
-import httpx
+import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-# ----------------------------
-# Env
-# ----------------------------
-WORKER_TOKEN = os.getenv("AI_WORKER_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip() or "gpt-5.2"
-
 app = FastAPI(title="MyTaxLead AI Worker", version="1.0.0")
+
+
+def env(name: str, default: str = "") -> str:
+    v = os.getenv(name, default)
+    return v.strip() if isinstance(v, str) else default
+
+
+AI_WORKER_TOKEN = env("AI_WORKER_TOKEN")
+OPENAI_API_KEY = env("OPENAI_API_KEY")
+OPENAI_MODEL = env("OPENAI_MODEL", "gpt-5.1")  # safe default
+TIMEOUT_SECS = int(env("HTTP_TIMEOUT", "120"))
 
 
 class AnalyzeRequest(BaseModel):
@@ -22,109 +26,162 @@ class AnalyzeRequest(BaseModel):
     upload_id: int
     client_id: int
     original_name: str
-    signed_url: str  # your PHP signed download URL
+    signed_url: str
+    hint: Optional[str] = None
 
 
-def require_token(authorization: Optional[str]):
-    if not WORKER_TOKEN:
-        # If you forgot to set the token in Railway Variables
+def require_token(authorization: Optional[str]) -> None:
+    if not AI_WORKER_TOKEN:
         raise HTTPException(status_code=500, detail="AI_WORKER_TOKEN not set")
-
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    m = re.match(r"Bearer\s+(.+)", authorization.strip(), re.I)
-    if not m:
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
-
-    if m.group(1).strip() != WORKER_TOKEN:
-        raise HTTPException(status_code=403, detail="Bad token")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    if token != AI_WORKER_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid token")
 
 
-def detect_kind(name: str) -> str:
-    n = (name or "").lower()
-    if n.endswith(".csv"):
-        return "csv"
-    if n.endswith(".xlsx") or n.endswith(".xls"):
-        return "xlsx"
-    if n.endswith(".pdf"):
+def download_to_bytes(url: str) -> bytes:
+    r = requests.get(url, timeout=TIMEOUT_SECS)
+    r.raise_for_status()
+    return r.content
+
+
+def detect_kind(original_name: str, signed_url: str) -> str:
+    name = (original_name or "").lower()
+    if name.endswith(".pdf"):
         return "pdf"
+    if name.endswith(".csv"):
+        return "csv"
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return "xlsx"
+    # fallback: try from url
+    u = (signed_url or "").lower()
+    for ext in (".pdf", ".csv", ".xlsx", ".xls"):
+        if ext in u:
+            return ext.replace(".", "")
     return "unknown"
 
 
-async def download_to_bytes(url: str) -> bytes:
-    timeout = httpx.Timeout(60.0, connect=15.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        r = await client.get(url)
-        if r.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Download failed: HTTP {r.status_code}")
-        return r.content
-
-
 def parse_csv_bytes(b: bytes) -> Dict[str, Any]:
-    # Keep lightweight: return a preview only (first ~200 lines)
-    text = b.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-    preview = lines[:200]
-    return {"lines_preview": preview, "line_count": len(lines)}
+    import pandas as pd
+    from io import BytesIO
 
-
-def parse_xlsx_bytes(_: bytes) -> Dict[str, Any]:
-    # For day-one simplicity, we don't parse XLSX locally.
-    # We send raw bytes info + filename to the model for instructions / summary.
-    return {"note": "XLSX received. (Local parsing can be added later.)"}
-
-
-def parse_pdf_bytes(_: bytes) -> Dict[str, Any]:
-    # For day-one simplicity, we don't OCR/PDF parse locally.
-    return {"note": "PDF received. (Text extraction/OCR can be added later.)"}
-
-
-async def llm_summary(extracted: Dict[str, Any], original_name: str) -> Dict[str, Any]:
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
-
-    # We ask for bookkeeping-relevant fields in JSON.
-    # This is a first version; we’ll refine schema later.
-    system = (
-        "You are an accounting assistant. "
-        "Given extracted data from a customer document (bank statement / CSV / PDF notice / spreadsheet), "
-        "return JSON with: "
-        "document_type, period_start, period_end, currency, totals (credits, debits, closing_balance if possible), "
-        "flags (missing_pages, unreadable, password_protected, inconsistent_dates), "
-        "and a short 'admin_review_notes'. "
-        "If data is insufficient, set fields to null and explain in admin_review_notes."
-    )
-
-    user_payload = {
-        "original_name": original_name,
-        "extracted": extracted,
+    df = pd.read_csv(BytesIO(b))
+    return {
+        "rows": int(df.shape[0]),
+        "cols": int(df.shape[1]),
+        "columns": list(df.columns.astype(str)),
+        "preview": df.head(20).to_dict(orient="records"),
     }
 
-    # Using OpenAI Responses API via the Python SDK.
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
 
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(user_payload)},
-        ],
-        # Keep deterministic-ish for bookkeeping extraction
-        temperature=0.2,
-    )
+def parse_xlsx_bytes(b: bytes) -> Dict[str, Any]:
+    import pandas as pd
+    from io import BytesIO
 
-    text = resp.output_text or ""
-    # Try to find a JSON object in the response
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return {"raw": text.strip()}
+    xls = pd.ExcelFile(BytesIO(b))
+    sheets = {}
+    for s in xls.sheet_names[:5]:
+        df = xls.parse(s).head(20)
+        sheets[s] = {
+            "rows_preview": int(df.shape[0]),
+            "cols": int(df.shape[1]),
+            "columns": list(df.columns.astype(str)),
+            "preview": df.to_dict(orient="records"),
+        }
+    return {"sheets": sheets, "sheet_names": xls.sheet_names}
 
+
+def parse_pdf_bytes(b: bytes) -> Dict[str, Any]:
+    from io import BytesIO
+    from PyPDF2 import PdfReader
+
+    reader = PdfReader(BytesIO(b))
+    pages = []
+    for i, p in enumerate(reader.pages[:5]):
+        txt = (p.extract_text() or "").strip()
+        pages.append({"page": i + 1, "text": txt[:4000]})
+    return {"pages": pages, "page_count": len(reader.pages)}
+
+
+def llm_summary(extracted: Dict[str, Any], original_name: str) -> Dict[str, Any]:
+    # If no OpenAI key, return a basic summary so the pipeline still works.
+    if not OPENAI_API_KEY:
+        return {
+            "ok": True,
+            "model": None,
+            "summary": "OPENAI_API_KEY not set. Returning non-AI extracted preview only.",
+            "actions": [],
+            "flags": ["missing_openai_api_key"]
+        }
+
+    # Use OpenAI Responses API (recommended by OpenAI docs)
+    # If anything fails, we gracefully return extracted only.
     try:
-        return json.loads(m.group(0))
-    except Exception:
-        return {"raw": text.strip()}
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+
+        prompt = f"""
+You are an accounting document assistant.
+Given extracted data from a file named: {original_name}
+Return JSON only with:
+- summary: short human summary
+- doc_type: what kind of document it is
+- key_fields: dict of important fields found
+- issues: list of possible issues/missing info
+"""
+
+        resp = client.responses.create(
+            model=OPENAI_MODEL or "gpt-5.1",
+            input=[
+                {"role": "system", "content": "Return STRICT JSON only. No markdown."},
+                {"role": "user", "content": prompt},
+                {"role": "user", "content": json.dumps(extracted)[:150000]},
+            ],
+        )
+
+        text = ""
+        # responses API returns items; easiest is output_text helper if available
+        if hasattr(resp, "output_text"):
+            text = resp.output_text
+        else:
+            # fallback: try to stitch
+            for item in getattr(resp, "output", []) or []:
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            text += c.get("text", "")
+
+        text = (text or "").strip()
+
+        # Try to parse JSON even if wrapped
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            text = m.group(0)
+
+        try:
+            js = json.loads(text)
+            return {"ok": True, "model": OPENAI_MODEL, **js}
+        except Exception:
+            return {
+                "ok": True,
+                "model": OPENAI_MODEL,
+                "summary": "AI returned non-JSON. Returning raw output.",
+                "raw": text
+            }
+
+    except Exception as e:
+        return {
+            "ok": True,
+            "model": OPENAI_MODEL,
+            "summary": "AI call failed. Returning extracted preview only.",
+            "error": str(e),
+        }
+
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "mytaxlead-ai-worker"}
 
 
 @app.get("/health")
@@ -133,28 +190,33 @@ def health():
 
 
 @app.post("/analyze")
-async def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(None)):
+def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=None)):
     require_token(authorization)
 
-    kind = detect_kind(req.original_name)
-    b = await download_to_bytes(req.signed_url)
+    kind = detect_kind(req.original_name, req.signed_url)
+    b = download_to_bytes(req.signed_url)
 
     extracted: Dict[str, Any] = {
         "kind": kind,
         "original_name": req.original_name,
-        "bytes_len": len(b),
+        "upload_id": req.upload_id,
+        "client_id": req.client_id,
+        "job_id": req.job_id,
     }
 
-    if kind == "csv":
-        extracted["data"] = parse_csv_bytes(b)
-    elif kind == "xlsx":
-        extracted["data"] = parse_xlsx_bytes(b)
-    elif kind == "pdf":
-        extracted["data"] = parse_pdf_bytes(b)
-    else:
-        extracted["data"] = {"note": "Unknown file type"}
+    try:
+        if kind == "csv":
+            extracted["data"] = parse_csv_bytes(b)
+        elif kind == "xlsx":
+            extracted["data"] = parse_xlsx_bytes(b)
+        elif kind == "pdf":
+            extracted["data"] = parse_pdf_bytes(b)
+        else:
+            extracted["data"] = {"note": "Unknown file type", "bytes": len(b)}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Parse failed: {e}")
 
-    summary = await llm_summary(extracted, req.original_name)
+    summary = llm_summary(extracted, req.original_name)
 
     return {
         "ok": True,
