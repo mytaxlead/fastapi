@@ -3,13 +3,13 @@ import json
 import re
 import math
 import hashlib
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="MyTaxLead AI Worker", version="1.0.1")
+app = FastAPI(title="MyTaxLead AI Worker", version="1.1.0")
 
 
 def env(name: str, default: str = "") -> str:
@@ -19,8 +19,17 @@ def env(name: str, default: str = "") -> str:
 
 AI_WORKER_TOKEN = env("AI_WORKER_TOKEN")
 OPENAI_API_KEY = env("OPENAI_API_KEY")
+# gpt-5.2 is valid per OpenAI model docs; leave blank in Railway to use default here.
 OPENAI_MODEL = env("OPENAI_MODEL", "gpt-5.2")
-TIMEOUT_SECS = int(env("HTTP_TIMEOUT", "120"))
+TIMEOUT_SECS = int(env("HTTP_TIMEOUT", "180"))
+
+# If 0 => ALL rows (what you asked for).
+# If you ever hit memory issues, set MAX_ROWS=5000 etc in Railway variables.
+MAX_ROWS = int(env("MAX_ROWS", "0"))
+
+# For XLSX, you may have multiple sheets. Default "all" is heavy.
+# Set MAX_SHEETS=1 for only first sheet.
+MAX_SHEETS = int(env("MAX_SHEETS", "5"))
 
 
 class AnalyzeRequest(BaseModel):
@@ -33,7 +42,6 @@ class AnalyzeRequest(BaseModel):
 
     callback_url: Optional[str] = None
     webhook_secret: Optional[str] = None
-
     hint: Optional[str] = None
 
 
@@ -81,16 +89,26 @@ def _sanitize_jsonable(x: Any) -> Any:
     return x
 
 
+def _maybe_limit_rows(rows: List[dict]) -> List[dict]:
+    if MAX_ROWS and MAX_ROWS > 0:
+        return rows[:MAX_ROWS]
+    return rows
+
+
 def parse_csv_bytes(b: bytes) -> Dict[str, Any]:
     import pandas as pd
     from io import BytesIO
 
-    df = pd.read_csv(BytesIO(b))
+    # Keep as strings where possible (bank statements can have weird formatting)
+    df = pd.read_csv(BytesIO(b), dtype=str, keep_default_na=False)
+    records = df.to_dict(orient="records")
+    records = _maybe_limit_rows(records)
+
     out = {
         "rows": int(df.shape[0]),
         "cols": int(df.shape[1]),
         "columns": list(df.columns.astype(str)),
-        "preview": df.head(200).to_dict(orient="records"),
+        "records": records,  # <-- FULL rows here (or limited if MAX_ROWS set)
     }
     return _sanitize_jsonable(out)
 
@@ -100,20 +118,28 @@ def parse_xlsx_bytes(b: bytes) -> Dict[str, Any]:
     from io import BytesIO
 
     xls = pd.ExcelFile(BytesIO(b))
-    sheets = {}
-    for s in xls.sheet_names[:5]:
-        df = xls.parse(s).head(200)
-        sheets[s] = {
-            "rows_preview": int(df.shape[0]),
+    sheet_names = xls.sheet_names
+    sheets_out: Dict[str, Any] = {}
+
+    # Process first N sheets (default 5)
+    for s in sheet_names[: max(1, MAX_SHEETS)]:
+        df = xls.parse(s, dtype=str, keep_default_na=False)
+        records = df.to_dict(orient="records")
+        records = _maybe_limit_rows(records)
+
+        sheets_out[s] = {
+            "rows": int(df.shape[0]),
             "cols": int(df.shape[1]),
             "columns": list(df.columns.astype(str)),
-            "preview": df.to_dict(orient="records"),
+            "records": records,  # <-- FULL rows here
         }
-    out = {"sheets": sheets, "sheet_names": xls.sheet_names}
+
+    out = {"sheet_names": sheet_names, "sheets": sheets_out}
     return _sanitize_jsonable(out)
 
 
 def parse_pdf_bytes(b: bytes) -> Dict[str, Any]:
+    # PDFs are not “rows”; we extract text.
     from io import BytesIO
     from PyPDF2 import PdfReader
 
@@ -121,17 +147,18 @@ def parse_pdf_bytes(b: bytes) -> Dict[str, Any]:
     pages = []
     for i, p in enumerate(reader.pages[:10]):
         txt = (p.extract_text() or "").strip()
-        pages.append({"page": i + 1, "text": txt[:8000]})
+        pages.append({"page": i + 1, "text": txt[:12000]})
     out = {"pages": pages, "page_count": len(reader.pages)}
     return _sanitize_jsonable(out)
 
 
 def llm_summary(extracted: Dict[str, Any], original_name: str) -> Dict[str, Any]:
+    # If no OpenAI key, pipeline still works and admin can view extracted.
     if not OPENAI_API_KEY:
         return {
             "ok": True,
             "model": None,
-            "summary": "OPENAI_API_KEY not set. Returning extracted preview only.",
+            "summary": "OPENAI_API_KEY not set. Showing extracted data only.",
             "doc_type": "unknown",
             "key_fields": {},
             "issues": ["missing_openai_api_key"],
@@ -149,17 +176,36 @@ File name: {original_name}
 Return STRICT JSON ONLY:
 - summary
 - doc_type (bank_statement / card_statement / invoice / payroll / unknown)
-- key_fields (account name, bank, period, opening/closing balance, totals)
-- issues (missing pages, unclear currency, etc.)
-- transactions_hint (what the columns mean / what to look for)
+- key_fields (account name, bank, period, opening balance, closing balance, totals)
+- issues (missing pages, unclear currency, duplicates, etc.)
+- transactions_hint (what the columns likely mean)
 """
+
+        # IMPORTANT: don't send *all* rows to the model (too expensive/slow).
+        # We send a compact sample + column names and totals.
+        compact = extracted.copy()
+        try:
+            if compact.get("kind") == "csv" and "data" in compact:
+                data = compact["data"]
+                cols = data.get("columns", [])
+                recs = data.get("records", [])
+                compact["data"] = {"columns": cols, "sample": recs[:200], "rows": data.get("rows"), "cols": data.get("cols")}
+            if compact.get("kind") == "xlsx" and "data" in compact:
+                data = compact["data"]
+                sheets = data.get("sheets", {})
+                new_sheets = {}
+                for sn, sd in list(sheets.items())[:3]:
+                    new_sheets[sn] = {"columns": sd.get("columns", []), "sample": (sd.get("records", [])[:200]), "rows": sd.get("rows"), "cols": sd.get("cols")}
+                compact["data"] = {"sheet_names": data.get("sheet_names", []), "sheets": new_sheets}
+        except Exception:
+            pass
 
         resp = client.responses.create(
             model=OPENAI_MODEL or "gpt-5.2",
             input=[
                 {"role": "system", "content": "Return STRICT JSON only. No markdown."},
                 {"role": "user", "content": prompt},
-                {"role": "user", "content": json.dumps(extracted)[:180000]},
+                {"role": "user", "content": json.dumps(compact)[:180000]},
             ],
         )
 
@@ -190,16 +236,13 @@ Return STRICT JSON ONLY:
         return {
             "ok": True,
             "model": OPENAI_MODEL,
-            "summary": "AI call failed. Returning extracted preview only.",
+            "summary": "AI call failed. Showing extracted data only.",
             "error": str(e),
         }
 
 
 def post_callback(callback_url: str, webhook_secret: str, payload: Dict[str, Any]) -> None:
-    headers = {
-        "Content-Type": "application/json",
-        "X-AI-Webhook-Secret": webhook_secret,
-    }
+    headers = {"Content-Type": "application/json", "X-AI-Webhook-Secret": webhook_secret}
     r = requests.post(callback_url, json=payload, headers=headers, timeout=TIMEOUT_SECS)
     r.raise_for_status()
 
@@ -284,5 +327,4 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
         except Exception as e:
             payload["warning"] = f"Callback failed: {e}"
 
-    # ALSO return full payload to the PHP caller (so you can store it even if callback fails)
     return payload
