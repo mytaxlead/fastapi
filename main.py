@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import math
 import hashlib
 from typing import Any, Dict, Optional
 
@@ -18,8 +19,24 @@ def env(name: str, default: str = "") -> str:
 
 AI_WORKER_TOKEN = env("AI_WORKER_TOKEN")
 OPENAI_API_KEY = env("OPENAI_API_KEY")
-OPENAI_MODEL = env("OPENAI_MODEL", "gpt-5.1")
+OPENAI_MODEL = env("OPENAI_MODEL", "gpt-5.1")  # safe default
 TIMEOUT_SECS = int(env("HTTP_TIMEOUT", "120"))
+
+
+def clean_json(obj: Any) -> Any:
+    """
+    Recursively replace NaN / Infinity with None so JSON is valid.
+    FastAPI/Starlette will crash if NaN is returned in JSON.
+    """
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: clean_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [clean_json(v) for v in obj]
+    return obj
 
 
 class AnalyzeRequest(BaseModel):
@@ -29,6 +46,7 @@ class AnalyzeRequest(BaseModel):
     original_name: str
     signed_url: str
     hint: Optional[str] = None
+    # (optional fields from your PHP payload won't break; Pydantic ignores extra by default)
 
 
 def require_token(authorization: Optional[str]) -> None:
@@ -56,6 +74,7 @@ def detect_kind(original_name: str, signed_url: str) -> str:
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return "xlsx"
 
+    # fallback: try from url
     u = (signed_url or "").lower()
     for ext in (".pdf", ".csv", ".xlsx", ".xls"):
         if ext in u:
@@ -106,6 +125,7 @@ def parse_pdf_bytes(b: bytes) -> Dict[str, Any]:
 
 
 def llm_summary(extracted: Dict[str, Any], original_name: str) -> Dict[str, Any]:
+    # If no OpenAI key, return a basic summary so the pipeline still works.
     if not OPENAI_API_KEY:
         return {
             "ok": True,
@@ -134,7 +154,7 @@ Return JSON only with:
             input=[
                 {"role": "system", "content": "Return STRICT JSON only. No markdown."},
                 {"role": "user", "content": prompt},
-                {"role": "user", "content": json.dumps(extracted)[:150000]},
+                {"role": "user", "content": json.dumps(clean_json(extracted))[:150000]},
             ],
         )
 
@@ -149,6 +169,8 @@ Return JSON only with:
                             text += c.get("text", "")
 
         text = (text or "").strip()
+
+        # Try to parse JSON even if wrapped
         m = re.search(r"\{.*\}", text, re.S)
         if m:
             text = m.group(0)
@@ -157,10 +179,20 @@ Return JSON only with:
             js = json.loads(text)
             return {"ok": True, "model": OPENAI_MODEL, **js}
         except Exception:
-            return {"ok": True, "model": OPENAI_MODEL, "summary": "AI returned non-JSON.", "raw": text}
+            return {
+                "ok": True,
+                "model": OPENAI_MODEL,
+                "summary": "AI returned non-JSON. Returning raw output.",
+                "raw": text,
+            }
 
     except Exception as e:
-        return {"ok": True, "model": OPENAI_MODEL, "summary": "AI call failed.", "error": str(e)}
+        return {
+            "ok": True,
+            "model": OPENAI_MODEL,
+            "summary": "AI call failed. Returning extracted preview only.",
+            "error": str(e),
+        }
 
 
 @app.get("/")
@@ -213,7 +245,7 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
 
     summary = llm_summary(extracted, req.original_name)
 
-    return {
+    response = {
         "ok": True,
         "job_id": req.job_id,
         "upload_id": req.upload_id,
@@ -221,3 +253,6 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
         "extracted": extracted,
         "summary": summary,
     }
+
+    # CRITICAL: sanitize NaN/Infinity from pandas outputs
+    return clean_json(response)
