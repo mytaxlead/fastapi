@@ -226,3 +226,14 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
         "extracted": extracted,
         "summary": summary,
     }
+    import hashlib
+
+@app.get("/debug_token")
+def debug_token():
+    t = AI_WORKER_TOKEN or ""
+    return {
+        "len": len(t),
+        "sha256": hashlib.sha256(t.encode("utf-8")).hexdigest(),
+        "starts": t[:2],
+        "ends": t[-2:],
+    }
