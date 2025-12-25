@@ -106,6 +106,7 @@ def _maybe_limit_rows(rows: List[dict]) -> List[dict]:
 # ----------------------------
 _money_strip_re = re.compile(r"[^\d\-\.\,]")
 
+
 def to_float_money(v: Any) -> Optional[float]:
     if v is None:
         return None
@@ -132,7 +133,7 @@ def to_float_money(v: Any) -> Optional[float]:
 def parse_date_any(v: Any) -> Optional[str]:
     """
     Return ISO date string YYYY-MM-DD when possible.
-    Accepts: dd/mm/yyyy, yyyy-mm-dd, dd Mon yyyy, etc.
+    Accepts: dd/mm/yyyy, yyyy-mm-dd, dd Mon yyyy, and a few datetime forms.
     """
     if v is None:
         return None
@@ -172,7 +173,7 @@ def parse_date_any(v: Any) -> Optional[str]:
             except Exception:
                 return None
 
-    # Try common timestamp-ish forms
+    # common datetime-ish
     for fmt in ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%d/%m/%y"):
         try:
             return datetime.strptime(s, fmt).date().isoformat()
@@ -184,7 +185,6 @@ def parse_date_any(v: Any) -> Optional[str]:
 
 def infer_currency(text: str) -> str:
     t = (text or "").upper()
-    # prefer explicit code
     if "GBP" in t or "£" in t:
         return "GBP"
     if "EUR" in t or "€" in t:
@@ -259,7 +259,7 @@ def parse_pdf_bytes(b: bytes) -> Dict[str, Any]:
 def pdf_extract_transactions(full_text: str) -> List[Dict[str, Any]]:
     """
     Heuristic parser for statement-like PDFs.
-    Looks for lines containing date + amounts, and builds rows with:
+    Builds rows with:
       processed_date, created_date, type, description, paid_out, paid_in, amount, balance
     """
     text = full_text or ""
@@ -296,7 +296,6 @@ def pdf_extract_transactions(full_text: str) -> List[Dict[str, Any]]:
         if len(amts) >= 3:
             a1 = to_float_money(amts[-3])
             a2 = to_float_money(amts[-2])
-            # Treat as "paid out", "paid in" then "balance" (common in ANNA-like)
             paid_out = a1
             paid_in = a2
             if paid_in and paid_in != 0:
@@ -468,7 +467,6 @@ def compute_reconciliation(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     money_out = 0.0
     net = 0.0
 
-    # Prefer balance on first/last dated row
     opening = None
     closing = None
     for r in rows:
@@ -494,7 +492,7 @@ def compute_reconciliation(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     recon_diff = None
     if opening is not None and closing is not None:
         recon_diff = (opening + net) - closing
-        recon_ok = abs(recon_diff) <= 0.02  # 2p tolerance
+        recon_ok = abs(recon_diff) <= 0.02
 
     return {
         "opening_balance_inferred": (round(opening, 2) if opening is not None else None),
@@ -550,8 +548,7 @@ def suspicious_flags(rows: List[Dict[str, Any]]) -> List[str]:
 
     cash_count = sum(
         1 for r in rows
-        if (r.get("type") or "").upper() == "CASH"
-        or "cash" in (r.get("description") or "").lower()
+        if (r.get("type") or "").upper() == "CASH" or "cash" in (r.get("description") or "").lower()
     )
     if cash_count >= 10:
         flags.append(f"high_cash_activity({cash_count})")
@@ -607,205 +604,6 @@ def to_bookkeeping_csv(rows: List[Dict[str, Any]]) -> str:
 
 
 # ----------------------------
-# Deterministic categorisation + computed SA/Company summaries
-# ----------------------------
-def classify_transaction(desc: str, typ: Optional[str], money_in: Optional[float], money_out: Optional[float]) -> Tuple[str, float, str]:
-    """
-    Returns: (category, confidence, notes)
-    Categories are bookkeeping-friendly (not HMRC-final).
-    """
-    d = (desc or "").lower()
-    t = (typ or "").lower()
-
-    # Transfers / internal movement
-    if "transfer" in d or "faster payment" in d or "fp" == t or "internal transfer" in d:
-        return ("Transfers", 0.75, "Looks like a transfer/faster payment")
-
-    # Bank fees/charges
-    if "fee" in d or "charge" in d or "commission" in d or t == "fee":
-        return ("Bank fees", 0.85, "Fee/charge detected")
-
-    # Cash
-    if "cash" in d or t == "cash":
-        if money_in and money_in > 0:
-            return ("Cash deposit", 0.75, "Cash deposit / cash paid in")
-        if money_out and money_out > 0:
-            return ("Cash withdrawal", 0.75, "Cash withdrawal / cash paid out")
-        return ("Cash", 0.6, "Cash-related")
-
-    # Subscriptions/software
-    if "subscription" in d or "monthly" in d or "apple.com" in d or "google" in d or "microsoft" in d or "adobe" in d:
-        return ("Subscriptions", 0.7, "Recurring subscription-like merchant")
-
-    # Fuel / vehicle
-    if "shell" in d or "bp " in d or "esso" in d or "petrol" in d or "fuel" in d:
-        return ("Fuel", 0.8, "Fuel merchant keywords")
-
-    # Rent / property
-    if "rent" in d or "landlord" in d or "lease" in d:
-        return ("Rent", 0.8, "Rent keyword")
-
-    # Card sales / payments processors
-    if "stripe" in d or "sumup" in d or "square" in d or "paypal" in d:
-        if money_in and money_in > 0:
-            return ("Sales receipts", 0.7, "Payment processor money in")
-        return ("Payment processing", 0.6, "Processor keyword")
-
-    # Wages / payroll
-    if "payroll" in d or "salary" in d or "wage" in d or "hmrc" in d:
-        if money_out and money_out > 0:
-            return ("Wages/Payroll", 0.65, "Payroll keyword")
-        return ("HMRC/Tax", 0.55, "HMRC/tax keyword")
-
-    # Fallback
-    if money_in and money_in > 0:
-        return ("Income (uncategorised)", 0.35, "No strong pattern")
-    if money_out and money_out > 0:
-        return ("Expenses (uncategorised)", 0.35, "No strong pattern")
-    return ("Unknown", 0.2, "Insufficient data")
-
-
-def compute_breakdowns(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    income_by_cat: Dict[str, float] = {}
-    expense_by_cat: Dict[str, float] = {}
-    flags: List[str] = []
-
-    transfer_in = 0.0
-    transfer_out = 0.0
-
-    for r in rows:
-        mi = r.get("money_in")
-        mo = r.get("money_out")
-        desc = r.get("description") or ""
-        typ = r.get("type")
-
-        if not isinstance(mi, (int, float)) and not isinstance(mo, (int, float)):
-            continue
-
-        cat, conf, note = classify_transaction(desc, typ, float(mi) if isinstance(mi, (int, float)) else None, float(mo) if isinstance(mo, (int, float)) else None)
-        r["_category"] = cat
-        r["_category_confidence"] = conf
-
-        if cat == "Transfers":
-            if isinstance(mi, (int, float)):
-                transfer_in += float(mi)
-            if isinstance(mo, (int, float)):
-                transfer_out += float(mo)
-
-        if isinstance(mi, (int, float)) and mi > 0:
-            income_by_cat[cat] = income_by_cat.get(cat, 0.0) + float(mi)
-        if isinstance(mo, (int, float)) and mo > 0:
-            expense_by_cat[cat] = expense_by_cat.get(cat, 0.0) + float(mo)
-
-    # Round
-    income_by_cat = {k: round(v, 2) for k, v in income_by_cat.items()}
-    expense_by_cat = {k: round(v, 2) for k, v in expense_by_cat.items()}
-
-    return {
-        "income_by_category": dict(sorted(income_by_cat.items(), key=lambda kv: (-kv[1], kv[0]))),
-        "expense_by_category": dict(sorted(expense_by_cat.items(), key=lambda kv: (-kv[1], kv[0]))),
-        "transfer_totals": {
-            "transfer_in": round(transfer_in, 2),
-            "transfer_out": round(transfer_out, 2),
-        },
-        "notes": [
-            "Categories are heuristic. Transfers may include genuine income/expenses depending on client context.",
-            "Use 'follow_up_questions' to confirm treatment of transfers/cash/personal items.",
-        ],
-        "flags": flags,
-    }
-
-
-def compute_sa_company_summaries(recon: Dict[str, Any], breakdown: Dict[str, Any]) -> Dict[str, Any]:
-    total_in = float(recon.get("total_money_in") or 0.0)
-    total_out = float(recon.get("total_money_out") or 0.0)
-    net = float(recon.get("net_movement") or 0.0)
-
-    transfers_in = float(breakdown.get("transfer_totals", {}).get("transfer_in") or 0.0)
-    transfers_out = float(breakdown.get("transfer_totals", {}).get("transfer_out") or 0.0)
-
-    # Conservative "business-like" view: exclude Transfers category
-    income_ex_transfers = max(0.0, total_in - transfers_in)
-    expenses_ex_transfers = max(0.0, total_out - transfers_out)
-    profit_ex_transfers = income_ex_transfers - expenses_ex_transfers
-
-    expense_breakdown = dict(breakdown.get("expense_by_category") or {})
-    income_breakdown = dict(breakdown.get("income_by_category") or {})
-
-    # Remove transfer category from breakouts for “business-like” headline totals
-    expense_breakdown_no_transfers = {k: v for k, v in expense_breakdown.items() if k != "Transfers"}
-    income_breakdown_no_transfers = {k: v for k, v in income_breakdown.items() if k != "Transfers"}
-
-    return {
-        "sa_summary_computed": {
-            "total_income_gross": round(total_in, 2),
-            "total_expenses_gross": round(total_out, 2),
-            "net_movement": round(net, 2),
-            "total_income_excluding_transfers": round(income_ex_transfers, 2),
-            "total_allowable_expenses_excluding_transfers": round(expenses_ex_transfers, 2),
-            "net_profit_excluding_transfers": round(profit_ex_transfers, 2),
-            "expense_breakdown_excluding_transfers": expense_breakdown_no_transfers,
-            "income_breakdown_excluding_transfers": income_breakdown_no_transfers,
-            "notes": [
-                "Computed totals are from bank statement movements. Not final tax figures.",
-                "Transfers are excluded in the headline 'excluding transfers' totals, but must be reviewed.",
-            ],
-        },
-        "company_accounts_summary_computed": {
-            "turnover_gross": round(total_in, 2),
-            "operating_expenses_gross": round(total_out, 2),
-            "profit_before_tax_gross": round(net, 2),
-            "turnover_excluding_transfers": round(income_ex_transfers, 2),
-            "operating_expenses_excluding_transfers": round(expenses_ex_transfers, 2),
-            "profit_before_tax_excluding_transfers": round(profit_ex_transfers, 2),
-            "operating_expenses_breakdown_excluding_transfers": expense_breakdown_no_transfers,
-            "notes": [
-                "This is a bookkeeping-style view based on statement movements only.",
-                "Cost of sales is not inferred unless you tag categories more specifically.",
-            ],
-        },
-    }
-
-
-def build_accountant_box(
-    req_meta: Dict[str, Any],
-    currency: str,
-    period: Dict[str, Optional[str]],
-    recon: Dict[str, Any],
-    checks: Dict[str, Any],
-    breakdown: Dict[str, Any],
-) -> Dict[str, Any]:
-    dups = checks.get("duplicates") or []
-    gaps = checks.get("missing_period_gaps") or []
-    flags = checks.get("suspicious_flags") or []
-
-    return {
-        "title": "Accountant Summary",
-        "file": req_meta.get("file"),
-        "kind": req_meta.get("kind"),
-        "currency": currency,
-        "period_start": period.get("start"),
-        "period_end": period.get("end"),
-        "opening_balance": recon.get("opening_balance_inferred"),
-        "closing_balance": recon.get("closing_balance_inferred"),
-        "total_money_in": recon.get("total_money_in"),
-        "total_money_out": recon.get("total_money_out"),
-        "net_movement": recon.get("net_movement"),
-        "reconciles": recon.get("reconciles"),
-        "reconcile_diff": recon.get("reconcile_diff"),
-        "row_count": checks.get("row_count_normalized"),
-        "duplicates_count": len(dups) if isinstance(dups, list) else 0,
-        "gaps_count": len(gaps) if isinstance(gaps, list) else 0,
-        "suspicious_flags": flags,
-        "transfer_totals": breakdown.get("transfer_totals"),
-        "headline_notes": [
-            "Figures are computed from detected transactions. Review transfers/cash for personal items.",
-            "If 'reconciles' is false, the PDF extraction may have missed rows or balances.",
-        ],
-    }
-
-
-# ----------------------------
 # LLM layer (optional enhancement)
 # ----------------------------
 def llm_accountant_pack(
@@ -814,7 +612,6 @@ def llm_accountant_pack(
     reconciliation: Dict[str, Any],
     currency_guess: str,
 ) -> Dict[str, Any]:
-    # Deterministic fallback structure
     base = {
         "ok": True,
         "model": None,
@@ -1011,10 +808,6 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
     # ---------- Bookkeeping CSV
     bookkeeping_csv = to_bookkeeping_csv(normalized)
 
-    # ---------- Deterministic computed summaries
-    breakdown = compute_breakdowns(normalized)
-    computed = compute_sa_company_summaries(recon, breakdown)
-
     # ---------- Accountant pack (LLM enhancement)
     meta = {
         "file": req.original_name,
@@ -1026,9 +819,6 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
     }
     accountant_pack = llm_accountant_pack(meta, normalized, recon, currency_guess)
 
-    # ---------- Your clean UI box
-    accountant_box = build_accountant_box(meta, currency_guess, period, recon, checks, breakdown)
-
     payload = {
         "job_id": req.job_id,
         "upload_id": req.upload_id,
@@ -1036,19 +826,14 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
         "status": "done",
         "error": "",
 
-        # Keep your existing outputs (backwards compatible)
+        # keep compatible outputs for your PHP
         "extracted": extracted,
         "normalized_transactions": normalized,
         "reconciliation": recon,
         "checks": checks,
         "bookkeeping_csv": bookkeeping_csv,
 
-        # New: clean box for UI + deterministic totals
-        "accountant_box": accountant_box,
-        "transaction_breakdown": breakdown,
-        "computed_summaries": computed,
-
-        # LLM enhancement (optional)
+        # optional LLM pack
         "accountant_pack": accountant_pack,
     }
 
