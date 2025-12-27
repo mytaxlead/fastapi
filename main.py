@@ -8,10 +8,10 @@ from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, date
 
 import requests
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Body
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="MyTaxLead AI Worker", version="2.2.0")
+app = FastAPI(title="MyTaxLead AI Worker", version="2.2.1")
 
 
 # ----------------------------
@@ -65,28 +65,26 @@ class ChatMessage(BaseModel):
     content: str
 
 
+# NOTE: We keep these for internal use, BUT the /chat endpoint accepts your existing PHP payload too.
 class ChatRequest(BaseModel):
-    # Identity / session
     client_id: int
     job_id: Optional[int] = None
     upload_id: Optional[int] = None
-    session_id: Optional[str] = None  # your PHP can store per-client/per-job session id
+    session_id: Optional[str] = None
 
-    # Chat
     messages: List[ChatMessage] = Field(default_factory=list)
-
-    # Optional context (pass what you already have in PHP from bundle JSON)
     context: Optional[Dict[str, Any]] = None
 
-    # Helpful hints for the assistant
-    mode: str = "accountant"  # accountant | bookkeeping | qa
+    mode: str = "accountant"
     currency_hint: Optional[str] = None
 
 
-class ChatFile(BaseModel):
-    filename: str
+# IMPORTANT: This matches your PHP save_files_from_worker() expectations:
+#   name, mime, content_base64
+class WorkerFile(BaseModel):
+    name: str
     mime: str = "text/plain"
-    b64: str  # base64 content (utf-8 bytes)
+    content_base64: str
 
 
 class ChatResponse(BaseModel):
@@ -95,7 +93,7 @@ class ChatResponse(BaseModel):
     reply_text: str = ""
     follow_up_questions: List[str] = Field(default_factory=list)
     actions: List[Dict[str, Any]] = Field(default_factory=list)
-    files: List[ChatFile] = Field(default_factory=list)
+    files: List[WorkerFile] = Field(default_factory=list)
     issues: List[str] = Field(default_factory=list)
     debug: Optional[Dict[str, Any]] = None
 
@@ -663,7 +661,6 @@ def to_bookkeeping_csv(rows: List[Dict[str, Any]]) -> str:
 
 # ----------------------------
 # Deterministic categorisation + computed summaries
-# (used by AI Review page and chat context)
 # ----------------------------
 def classify_transaction(desc: str, typ: Optional[str], money_in: Optional[float], money_out: Optional[float]) -> Tuple[str, float, str]:
     d = (desc or "").lower()
@@ -907,7 +904,7 @@ follow_up_questions (list of strings).
 
 Be conservative: if unsure, category="Unknown" and add an issue.
 No markdown. JSON object only.
-"""
+""".strip()
 
     try:
         from openai import OpenAI
@@ -917,7 +914,7 @@ No markdown. JSON object only.
             model=OPENAI_MODEL or "gpt-5.2",
             input=[
                 {"role": "system", "content": "Return STRICT JSON only. No markdown."},
-                {"role": "user", "content": prompt.strip()},
+                {"role": "user", "content": prompt},
                 {"role": "user", "content": compact_json},
             ],
         )
@@ -950,19 +947,11 @@ No markdown. JSON object only.
 def _compact_context_for_chat(ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
     Reduce payload size; keep only what the model needs.
-    Expected ctx keys (if provided by PHP):
-      - accountant_box
-      - reconciliation
-      - checks
-      - computed_summaries
-      - transaction_breakdown
-      - normalized_transactions (optional)
     """
     if not isinstance(ctx, dict):
         return {}
 
-    # sample normalized rows if present
-    rows = ctx.get("normalized_transactions") or ctx.get("transactions") or []
+    rows = ctx.get("normalized_transactions") or ctx.get("transactions") or ctx.get("sample_transactions") or []
     if isinstance(rows, list):
         rows = rows[: max(1, CHAT_SAMPLE_ROWS)]
     else:
@@ -976,23 +965,23 @@ def _compact_context_for_chat(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "transaction_breakdown": ctx.get("transaction_breakdown") or {},
         "sample_transactions": rows,
     }
-    # hard cap
+
     txt = json.dumps(out, ensure_ascii=False)
     if len(txt) > CHAT_MAX_CHARS:
-        # drop sample transactions if too big
         out["sample_transactions"] = out["sample_transactions"][: max(1, min(50, CHAT_SAMPLE_ROWS))]
     return out
 
 
-def _b64_text_file(filename: str, text: str, mime: str = "text/plain") -> ChatFile:
+def _b64_text_file(name: str, text: str, mime: str = "text/plain") -> WorkerFile:
     raw = (text or "").encode("utf-8", errors="replace")
-    return ChatFile(filename=filename, mime=mime, b64=base64.b64encode(raw).decode("ascii"))
+    return WorkerFile(
+        name=name,
+        mime=mime,
+        content_base64=base64.b64encode(raw).decode("ascii"),
+    )
 
 
 def _safe_json_extract(text: str) -> Dict[str, Any]:
-    """
-    Model sometimes wraps JSON. Extract first {...} block.
-    """
     text = (text or "").strip()
     m = re.search(r"\{.*\}", text, re.S)
     if m:
@@ -1009,11 +998,6 @@ def llm_chat_reply(
     ctx_compact: Dict[str, Any],
     currency_hint: Optional[str],
 ) -> Dict[str, Any]:
-    """
-    Returns dict with keys:
-      reply_text, follow_up_questions(list), actions(list), file_requests(list), issues(list)
-    file_requests are instructions; we execute a safe subset.
-    """
     if not OPENAI_API_KEY:
         return {
             "reply_text": "OPENAI_API_KEY not set. Chat is unavailable on this worker.",
@@ -1023,9 +1007,7 @@ def llm_chat_reply(
             "issues": ["missing_openai_api_key"],
         }
 
-    # Keep only last N messages
     msgs = messages[-max(1, CHAT_MAX_MESSAGES):]
-    # Normalize roles
     norm_msgs = []
     for m in msgs:
         role = (m.role or "user").lower().strip()
@@ -1077,7 +1059,6 @@ Currency hint: {currency_hint or "unknown"}
         text = getattr(resp, "output_text", "") or ""
         js = _safe_json_extract(text)
 
-        # enforce shape
         out = {
             "reply_text": str(js.get("reply_text") or ""),
             "follow_up_questions": js.get("follow_up_questions") or [],
@@ -1093,6 +1074,7 @@ Currency hint: {currency_hint or "unknown"}
             out["file_requests"] = []
         if not isinstance(out["issues"], list):
             out["issues"] = []
+
         return _sanitize_jsonable(out)
 
     except Exception as e:
@@ -1230,7 +1212,6 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
         "period": period,
     }
     accountant_pack = llm_accountant_pack(meta, normalized, recon, currency_guess)
-
     accountant_box = build_accountant_box(meta, currency_guess, period, recon, checks, breakdown)
 
     payload = {
@@ -1265,42 +1246,77 @@ def analyze(req: AnalyzeRequest, authorization: Optional[str] = Header(default=N
     return _sanitize_jsonable(payload)
 
 
+# ----------------------------
+# CHAT endpoint
+# Accepts BOTH:
+#  - new format: { client_id, job_id, messages:[{role,content}], context, mode, currency_hint }
+#  - your PHP format: { client_id, job_id, message:"...", history:[...], context }
+# ----------------------------
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, authorization: Optional[str] = Header(default=None)):
-    """
-    Admin-only chat endpoint.
-    Your PHP should:
-      - load bundle JSON (exports_json) for that job
-      - store chat history per client/job/session in MySQL
-      - POST here with messages + selected context
-      - save returned assistant message + any returned files to /_uploads/ai_exports/... and link them
-    """
+def chat(payload: Dict[str, Any] = Body(...), authorization: Optional[str] = Header(default=None)):
     require_token(authorization)
 
-    # Context may be empty if still processing
-    ctx = req.context or {}
+    client_id = int(payload.get("client_id") or 0)
+    job_id = payload.get("job_id")
+    upload_id = payload.get("upload_id")
+    mode = str(payload.get("mode") or "accountant").strip()
+    currency_hint = payload.get("currency_hint")
+
+    if client_id <= 0:
+        raise HTTPException(status_code=400, detail="Missing client_id")
+
+    ctx = payload.get("context") or {}
     ctx_compact = _compact_context_for_chat(ctx)
 
-    # Execute chat
-    res = llm_chat_reply(req.mode, req.messages, ctx_compact, req.currency_hint)
+    # Build messages either from `messages` OR from `history` + `message`
+    msgs: List[ChatMessage] = []
 
-    # Build safe file outputs (only from safe kinds)
-    files: List[ChatFile] = []
+    if isinstance(payload.get("messages"), list):
+        for m in payload["messages"][-CHAT_MAX_MESSAGES:]:
+            if not isinstance(m, dict):
+                continue
+            msgs.append(ChatMessage(
+                role=str(m.get("role") or "user"),
+                content=str(m.get("content") or "")
+            ))
+    else:
+        # Your existing PHP sends `history` and `message`
+        history = payload.get("history") or []
+        if isinstance(history, list):
+            for m in history[-CHAT_MAX_MESSAGES:]:
+                if not isinstance(m, dict):
+                    continue
+                msgs.append(ChatMessage(
+                    role=str(m.get("role") or "user"),
+                    content=str(m.get("content") or "")
+                ))
+
+        message = str(payload.get("message") or "").strip()
+        if message:
+            msgs.append(ChatMessage(role="user", content=message))
+
+    if not msgs:
+        raise HTTPException(status_code=400, detail="No messages provided")
+
+    res = llm_chat_reply(mode, msgs, ctx_compact, currency_hint)
+
+    # Files: only safe kinds requested by the model
+    files: List[WorkerFile] = []
     file_requests = res.get("file_requests") or []
+
+    full_rows = []
+    if isinstance(ctx.get("normalized_transactions"), list):
+        full_rows = ctx.get("normalized_transactions") or []
+    elif isinstance(ctx_compact.get("sample_transactions"), list):
+        full_rows = ctx_compact.get("sample_transactions") or []
+
+    bk_csv_text = ""
+    try:
+        bk_csv_text = to_bookkeeping_csv(full_rows) if isinstance(full_rows, list) else ""
+    except Exception:
+        bk_csv_text = ""
+
     if isinstance(file_requests, list) and file_requests:
-        # We can generate from ctx_compact sample OR (better) from full normalized in ctx if present.
-        full_rows = []
-        if isinstance(ctx.get("normalized_transactions"), list):
-            full_rows = ctx.get("normalized_transactions") or []
-        elif isinstance(ctx_compact.get("sample_transactions"), list):
-            full_rows = ctx_compact.get("sample_transactions") or []
-
-        # Precompute a few things
-        try:
-            bk_csv_text = to_bookkeeping_csv(full_rows) if isinstance(full_rows, list) else ""
-        except Exception:
-            bk_csv_text = ""
-
         for fr in file_requests[:3]:
             if not isinstance(fr, dict):
                 continue
@@ -1308,29 +1324,36 @@ def chat(req: ChatRequest, authorization: Optional[str] = Header(default=None)):
             filename = (fr.get("filename") or kind or "file.txt").strip()
             filename = re.sub(r"[^A-Za-z0-9._\-]+", "_", filename)[:80] or "file.txt"
 
-            if kind == "bookkeeping_csv":
-                if bk_csv_text:
-                    files.append(_b64_text_file(filename if filename.endswith(".csv") else (filename + ".csv"), bk_csv_text, "text/csv"))
+            if kind == "bookkeeping_csv" and bk_csv_text:
+                if not filename.endswith(".csv"):
+                    filename += ".csv"
+                files.append(_b64_text_file(filename, bk_csv_text, "text/csv"))
+
             elif kind == "normalized_json":
+                if not filename.endswith(".json"):
+                    filename += ".json"
                 js = {
-                    "client_id": req.client_id,
-                    "job_id": req.job_id,
-                    "upload_id": req.upload_id,
+                    "client_id": client_id,
+                    "job_id": job_id,
+                    "upload_id": upload_id,
                     "normalized_transactions": full_rows,
                 }
-                files.append(_b64_text_file(filename if filename.endswith(".json") else (filename + ".json"), json.dumps(js, ensure_ascii=False, indent=2), "application/json"))
+                files.append(_b64_text_file(filename, json.dumps(js, ensure_ascii=False, indent=2), "application/json"))
+
             elif kind == "summary_json":
+                if not filename.endswith(".json"):
+                    filename += ".json"
                 js = {
-                    "client_id": req.client_id,
-                    "job_id": req.job_id,
-                    "upload_id": req.upload_id,
+                    "client_id": client_id,
+                    "job_id": job_id,
+                    "upload_id": upload_id,
                     "accountant_box": ctx.get("accountant_box") or ctx_compact.get("accountant_box") or {},
                     "reconciliation": ctx.get("reconciliation") or ctx_compact.get("reconciliation") or {},
                     "checks": ctx.get("checks") or ctx_compact.get("checks") or {},
                     "computed_summaries": ctx.get("computed_summaries") or ctx_compact.get("computed_summaries") or {},
                     "transaction_breakdown": ctx.get("transaction_breakdown") or ctx_compact.get("transaction_breakdown") or {},
                 }
-                files.append(_b64_text_file(filename if filename.endswith(".json") else (filename + ".json"), json.dumps(js, ensure_ascii=False, indent=2), "application/json"))
+                files.append(_b64_text_file(filename, json.dumps(js, ensure_ascii=False, indent=2), "application/json"))
 
     return ChatResponse(
         ok=True,
