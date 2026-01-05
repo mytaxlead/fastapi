@@ -79,12 +79,12 @@ class ChatRequest(BaseModel):
     currency_hint: Optional[str] = None
 
 
-# IMPORTANT: This matches your PHP save_files_from_worker() expectations:
-#   name, mime, content_base64
+# IMPORTANT: MUST match your PHP expectations:
+#   files[] = {filename, mime, b64}
 class WorkerFile(BaseModel):
-    name: str
-    mime: str = "text/plain"
-    content_base64: str
+    filename: str
+    mime: str = "application/octet-stream"
+    b64: str
 
 
 class ChatResponse(BaseModel):
@@ -975,9 +975,9 @@ def _compact_context_for_chat(ctx: Dict[str, Any]) -> Dict[str, Any]:
 def _b64_text_file(name: str, text: str, mime: str = "text/plain") -> WorkerFile:
     raw = (text or "").encode("utf-8", errors="replace")
     return WorkerFile(
-        name=name,
+        filename=name,
         mime=mime,
-        content_base64=base64.b64encode(raw).decode("ascii"),
+        b64=base64.b64encode(raw).decode("ascii"),
     )
 
 
